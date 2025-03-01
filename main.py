@@ -5,7 +5,7 @@ import time
 import subprocess
 from pyrogram import __version__
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, LinkPreviewOptions
 import logging
 import asyncio
 import requests
@@ -36,6 +36,32 @@ last_progress_update = {}
 # Track cancelled uploads
 upload_cancelled = {}
 active_processes = {}
+authorized_users = set()
+# Owner ID from config
+OWNER_ID = Config.OWNER_ID
+
+# Load authorized users from file
+def load_authorized_users():
+    auth_file = "authorized_users.txt"
+    if os.path.exists(auth_file):
+        with open(auth_file, "r") as f:
+            for line in f:
+                user_id = line.strip()
+                if user_id.isdigit():
+                    authorized_users.add(int(user_id))
+    logger.info(f"Loaded {len(authorized_users)} authorized users")
+
+# Save authorized users to file
+def save_authorized_users():
+    auth_file = "authorized_users.txt"
+    with open(auth_file, "w") as f:
+        for user_id in authorized_users:
+            f.write(f"{user_id}\n")
+    logger.info(f"Saved {len(authorized_users)} authorized users")
+
+# Check if user is authorized
+def is_authorized(user_id):
+    return user_id == OWNER_ID or user_id in authorized_users
 
 def format_size(size_bytes):
     """Format size in bytes to human readable format"""
@@ -520,6 +546,10 @@ async def upload_videos_to_telegram(user_id, files, playlist_title, message):
                     
                     # Delete progress message after upload
                     await progress_message.delete()
+
+                    # Add 4-second delay between uploads to avoid flood wait
+                    if part_index < len(split_files):
+                        await asyncio.sleep(Config.UPLOAD_INTERVAL)
                 
                 # Update status after all parts are uploaded
                 await message.edit_text(
@@ -568,10 +598,33 @@ async def upload_videos_to_telegram(user_id, files, playlist_title, message):
                     f"✅ Uploaded successfully!",
                     reply_markup=cancel_button
                 )
+
+            # Add 4-second delay between uploads to avoid flood wait
+            if i < len(files):
+                await asyncio.sleep(Config.UPLOAD_INTERVAL)
             
         except Exception as e:
             logger.error(f"Error uploading file {file_path}: {str(e)}")
             await app.send_message(user_id, f"Failed to upload {filename}: {str(e)}")
+
+            # If we get a flood wait error, add an extra delay
+            if "FLOOD_WAIT" in str(e):
+                wait_time = 20  # Default wait time if we can't extract the exact time
+                try:
+                    # Try to extract the wait time from the error message
+                    import re
+                    wait_match = re.search(r'A wait of (\d+) seconds', str(e))
+                    if wait_match:
+                        wait_time = int(wait_match.group(1)) + 2  # Add 2 seconds as buffer
+                except:
+                    pass
+                
+                logger.info(f"Got FLOOD_WAIT, waiting for {wait_time} seconds")
+                await message.edit_text(
+                    f"Rate limit hit. Waiting for {wait_time} seconds before continuing...",
+                    reply_markup=cancel_button
+                )
+                await asyncio.sleep(wait_time)
 
     # Remove user from active processes
     active_processes.pop(user_id, None)
@@ -877,6 +930,9 @@ async def upload_files_to_gofile(user_id, files, playlist_title, message):
                     f"❌ Upload failed.",
                     reply_markup=cancel_button
                 )
+            # Add 4-second delay between uploads to avoid rate limits
+            if i < len(files):
+                await asyncio.sleep(Config.UPLOAD_INTERVAL)
         
         except Exception as e:
             logger.error(f"Error uploading file to GoFile {file_path}: {str(e)}")
@@ -932,15 +988,45 @@ async def cancel_process(client, callback_query):
 
 @app.on_message(filters.command("start"))
 async def start_command(client, message):
-    await message.reply_text(
-        "Welcome to YouTube Playlist Downloader Bot!\n\n"
-        "Send me a YouTube playlist URL and I'll help you download it."
-    )
+    user_id = message.from_user.id
+    
+    if is_authorized(user_id):
+        await message.reply_text(
+            "Welcome to YouTube Playlist Downloader Bot!\n\n"
+            "Send me a YouTube playlist URL and I'll help you download it."
+        )
+    else:
+        # Create an inline keyboard with admin contact link
+        admin_button = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Contact Admin", url=f"https://t.me/{Config.ADMIN_USERNAME}")]
+        ])
+        
+        await message.reply_text(
+            "You are not authorized to use this bot.\n"
+            "Please contact the bot owner for authorization.",
+            reply_markup=admin_button,
+            link_preview_options=LinkPreviewOptions(is_disabled=True)
+        )
 
 @app.on_message(filters.regex(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'))
 async def handle_url(client, message):
     url = message.text.strip()
     user_id = message.from_user.id
+
+     # Check if user is authorized
+    if not is_authorized(user_id):
+        # Create an inline keyboard with admin contact link
+        admin_button = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Contact Admin", url=f"https://t.me/{Config.ADMIN_USERNAME}")]
+        ])
+        
+        await message.reply_text(
+            "You are not authorized to use this bot.\n"
+            "Please contact the bot owner for authorization.",
+            reply_markup=admin_button,
+            link_preview_options=LinkPreviewOptions(is_disabled=True)
+        )
+        return
 
     # Check if user already has an active process
     if user_id in active_processes and not active_processes[user_id].get("cancelled", False):
@@ -1066,9 +1152,54 @@ async def cancel_upload(client, callback_query):
     await callback_query.message.edit_text("Upload cancelled by user.")
     await callback_query.answer("Upload cancelled successfully")
 
+@app.on_message(filters.command("auth") & filters.user(OWNER_ID))
+async def auth_command(client, message):
+    # Check if the command has a user ID
+    if len(message.command) != 2:
+        await message.reply_text("Usage: /auth [user_id]")
+        return
+    
+    try:
+        user_id = int(message.command[1])
+        if user_id in authorized_users:
+            await message.reply_text(f"User {user_id} is already authorized.")
+        else:
+            authorized_users.add(user_id)
+            save_authorized_users()
+            await message.reply_text(f"User {user_id} has been authorized.")
+    except ValueError:
+        await message.reply_text("Invalid user ID. Please provide a valid numeric ID.")
+
+@app.on_message(filters.command("revoke") & filters.user(OWNER_ID))
+async def revoke_command(client, message):
+    # Check if the command has a user ID
+    if len(message.command) != 2:
+        await message.reply_text("Usage: /revoke [user_id]")
+        return
+    
+    try:
+        user_id = int(message.command[1])
+        if user_id in authorized_users:
+            authorized_users.remove(user_id)
+            save_authorized_users()
+            await message.reply_text(f"Authorization for user {user_id} has been revoked.")
+        else:
+            await message.reply_text(f"User {user_id} is not in the authorized list.")
+    except ValueError:
+        await message.reply_text("Invalid user ID. Please provide a valid numeric ID.")
+
+@app.on_message(filters.command("list") & filters.user(OWNER_ID))
+async def list_auth_command(client, message):
+    if not authorized_users:
+        await message.reply_text("No users are currently authorized.")
+    else:
+        auth_list = "\n".join([f"• {user_id}" for user_id in authorized_users])
+        await message.reply_text(f"Authorized users:\n{auth_list}")
+
 if __name__ == "__main__":
     if not os.path.exists("downloads"):
         os.makedirs("downloads")
-    
+    # Load authorized users when the bot starts
+    load_authorized_users()
     print("Bot is running...")
     app.run()
