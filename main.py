@@ -1161,15 +1161,24 @@ async def auth_command(client, message):
     
     try:
         user_id = int(message.command[1])
+        
+        # Try to get user info to include username in the response
+        try:
+            user = await app.get_users(user_id)
+            user_mention = f"@{user.username}" if user.username else f"[{user.first_name}](tg://user?id={user_id})"
+        except:
+            user_mention = f"User {user_id}"
+            
         if user_id in authorized_users:
-            await message.reply_text(f"User {user_id} is already authorized.")
+            await message.reply_text(f"{user_mention} is already authorized.")
         else:
             authorized_users.add(user_id)
             save_authorized_users()
-            await message.reply_text(f"User {user_id} has been authorized.")
+            await message.reply_text(f"{user_mention} has been authorized.")
     except ValueError:
         await message.reply_text("Invalid user ID. Please provide a valid numeric ID.")
 
+# Modify the revoke_command function to mention users
 @app.on_message(filters.command("revoke") & filters.user(OWNER_ID))
 async def revoke_command(client, message):
     # Check if the command has a user ID
@@ -1179,22 +1188,43 @@ async def revoke_command(client, message):
     
     try:
         user_id = int(message.command[1])
+        
+        # Try to get user info to include username in the response
+        try:
+            user = await app.get_users(user_id)
+            user_mention = f"@{user.username}" if user.username else f"[{user.first_name}](tg://user?id={user_id})"
+        except:
+            user_mention = f"User {user_id}"
+            
         if user_id in authorized_users:
             authorized_users.remove(user_id)
             save_authorized_users()
-            await message.reply_text(f"Authorization for user {user_id} has been revoked.")
+            await message.reply_text(f"Authorization for {user_mention} has been revoked.")
         else:
-            await message.reply_text(f"User {user_id} is not in the authorized list.")
+            await message.reply_text(f"{user_mention} is not in the authorized list.")
     except ValueError:
         await message.reply_text("Invalid user ID. Please provide a valid numeric ID.")
 
+# Modify the list_auth_command function to mention users
 @app.on_message(filters.command("list") & filters.user(OWNER_ID))
 async def list_auth_command(client, message):
     if not authorized_users:
         await message.reply_text("No users are currently authorized.")
     else:
-        auth_list = "\n".join([f"• {user_id}" for user_id in authorized_users])
-        await message.reply_text(f"Authorized users:\n{auth_list}")
+        # Get user info for each authorized user
+        auth_list = []
+        for user_id in authorized_users:
+            try:
+                user = await app.get_users(user_id)
+                if user.username:
+                    user_info = f"• {user_id} - @{user.username}"
+                else:
+                    user_info = f"• {user_id} - {user.first_name}"
+            except:
+                user_info = f"• {user_id}"
+            auth_list.append(user_info)
+        
+        await message.reply_text(f"Authorized users:\n{chr(10).join(auth_list)}")
 
 if __name__ == "__main__":
     if not os.path.exists("downloads"):
