@@ -2,6 +2,7 @@ import yt_dlp
 import os
 import shutil
 import time
+import subprocess
 from pyrogram import __version__
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -60,6 +61,53 @@ def create_download_folder(user_id):
     if not os.path.exists(download_path):
         os.makedirs(download_path)
     return download_path
+
+# Add this function to check file size
+def check_file_size(file_path):
+    """Check if file size exceeds Telegram's limit"""
+    file_size = os.path.getsize(file_path)
+    # 2GB limit for regular users (slightly less to be safe)
+    return file_size > 1.9 * 1024 * 1024 * 1024
+
+# Add this function to split large videos
+async def split_video(file_path, user_id, message):
+    """Split large video into smaller parts"""
+    base_name = os.path.basename(file_path)
+    name_without_ext = os.path.splitext(base_name)[0]
+    output_dir = f"downloads/{user_id}/split"
+    
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    # Each part will be ~1.8GB
+    part_size = "1800M"
+    
+    await message.edit_text(f"File {base_name} is too large for Telegram. Splitting into smaller parts...")
+    
+    try:
+        # Use ffmpeg to split the video
+        cmd = [
+            'ffmpeg', '-i', file_path, 
+            '-c', 'copy', 
+            '-map', '0', 
+            '-segment_time', '00:30:00', 
+            '-f', 'segment', 
+            f"{output_dir}/{name_without_ext}_%03d.mp4"
+        ]
+        
+        subprocess.run(cmd, check=True)
+        
+        # Get list of split files
+        split_files = sorted([
+            os.path.join(output_dir, f) 
+            for f in os.listdir(output_dir) 
+            if f.startswith(name_without_ext)
+        ])
+        
+        return split_files
+    except Exception as e:
+        logger.error(f"Error splitting video: {str(e)}")
+        return None
 
 async def progress(current, total, message, start_time, operation, filename=None, playlist_title=None, file_index=None, total_files=None):
     """Generic progress callback for uploads/downloads"""
@@ -122,7 +170,7 @@ def get_video_info(url):
     """Get playlist information"""
     ydl_opts = {
         'quiet': True,
-        'cookies': 'cookies.txt',
+        'cookiefile': 'cookies.txt',
         'no_warnings': True,
         'format': 'best',
         'outtmpl': '%(title)s.%(ext)s',
@@ -151,7 +199,7 @@ def download_video(video_url, download_path, quality):
     ydl_opts = {
         'format': format_string.get(quality, 'bestvideo+bestaudio/best'),
         'outtmpl': os.path.join(download_path, '%(title)s.%(ext)s'),
-        'cookies': 'cookies.txt',
+        'cookiefile': 'cookies.txt',
         'merge_output_format': 'mp4',
         'ignoreerrors': True,
         'no_warnings': True,
@@ -223,7 +271,6 @@ async def download_playlist(url, user_id, quality, message):
 
     return downloaded_files, playlist_title
 
-# Modify the upload function to check for cancellation
 async def upload_videos_to_telegram(user_id, files, playlist_title, message):
     """Upload downloaded videos to Telegram"""
     # Add cancel button to the status message
@@ -232,7 +279,7 @@ async def upload_videos_to_telegram(user_id, files, playlist_title, message):
     ])
     
     # Check if cover image exists
-    thumbnail_path = "covers/cover.jpg"
+    thumbnail_path = "covers/cover1.jpg"
     has_thumbnail = os.path.exists(thumbnail_path)
 
     await message.edit_text(
@@ -256,36 +303,81 @@ async def upload_videos_to_telegram(user_id, files, playlist_title, message):
         try:
             filename = os.path.basename(file_path)
             
-            # Get video duration if possible
-            try:
-                duration_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file_path]
-                duration = int(float(subprocess.check_output(duration_cmd).decode('utf-8').strip()))
-            except:
-                duration = 0
-            
-            # Create a new message for progress tracking
-            progress_message = await app.send_message(
-                user_id,
-                f"Starting upload: {filename}"
-            )
-            
-            # Start time for progress
-            start_time = time.time()
-            
-            # Upload with progress
-            await app.send_video(
-                user_id,
-                file_path,
-                caption=f"{filename}\n\nFrom playlist: {playlist_title}",
-                supports_streaming=True,
-                duration=duration,
-                thumb=thumbnail_path if has_thumbnail else None,
-                progress=progress,
-                progress_args=(progress_message, start_time, "upload", filename, playlist_title, i, len(files))
-            )
-            
-            # Delete progress message after upload
-            await progress_message.delete()
+            # Check if file is too large
+            if check_file_size(file_path):
+                # Split the video into parts
+                split_files = await split_video(file_path, user_id, message)
+                
+                if not split_files:
+                    await app.send_message(user_id, f"Failed to split large file: {filename}")
+                    continue
+                
+                # Upload each part
+                for part_index, part_file in enumerate(split_files, 1):
+                    part_filename = os.path.basename(part_file)
+                    
+                    # Get video duration if possible
+                    try:
+                        duration_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', part_file]
+                        duration = int(float(subprocess.check_output(duration_cmd).decode('utf-8').strip()))
+                    except:
+                        duration = 0
+                    
+                    # Create a new message for progress tracking
+                    progress_message = await app.send_message(
+                        user_id,
+                        f"Starting upload: {part_filename} (Part {part_index}/{len(split_files)})"
+                    )
+                    
+                    # Start time for progress
+                    start_time = time.time()
+                    
+                    # Upload with progress
+                    await app.send_video(
+                        user_id,
+                        part_file,
+                        caption=f"{filename} - Part {part_index}/{len(split_files)}\n\nFrom playlist: {playlist_title}",
+                        supports_streaming=True,
+                        duration=duration,
+                        thumb=thumbnail_path if has_thumbnail else None,
+                        progress=progress,
+                        progress_args=(progress_message, start_time, "upload", part_filename, playlist_title, i, len(files))
+                    )
+                    
+                    # Delete progress message after upload
+                    await progress_message.delete()
+            else:
+                # Regular upload for normal sized files
+                # Get video duration if possible
+                try:
+                    duration_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file_path]
+                    duration = int(float(subprocess.check_output(duration_cmd).decode('utf-8').strip()))
+                except:
+                    duration = 0
+                
+                # Create a new message for progress tracking
+                progress_message = await app.send_message(
+                    user_id,
+                    f"Starting upload: {filename}"
+                )
+                
+                # Start time for progress
+                start_time = time.time()
+                
+                # Upload with progress
+                await app.send_video(
+                    user_id,
+                    file_path,
+                    caption=f"{filename}\n\nFrom playlist: {playlist_title}",
+                    supports_streaming=True,
+                    duration=duration,
+                    thumb=thumbnail_path if has_thumbnail else None,
+                    progress=progress,
+                    progress_args=(progress_message, start_time, "upload", filename, playlist_title, i, len(files))
+                )
+                
+                # Delete progress message after upload
+                await progress_message.delete()
             
         except Exception as e:
             logger.error(f"Error uploading file {file_path}: {str(e)}")
@@ -293,6 +385,11 @@ async def upload_videos_to_telegram(user_id, files, playlist_title, message):
 
     # Remove user from active processes
     active_processes.pop(user_id, None)
+    
+    # Clean up split files directory if it exists
+    split_dir = f"downloads/{user_id}/split"
+    if os.path.exists(split_dir):
+        shutil.rmtree(split_dir)
     
     await message.edit_text(
         f"✅ Process completed!\n"
@@ -311,11 +408,16 @@ async def start_command(client, message):
 async def handle_url(client, message):
     url = message.text.strip()
     user_id = message.from_user.id
-    
 
-    
-    status_message = await message.reply_text("Checking URL...")
-    
+    # Check if user already has an active process
+    if user_id in active_processes and not active_processes[user_id].get("cancelled", False):
+        await message.reply_text(
+            "⚠️ You already have an active download process.\n"
+            "Please wait for it to complete or cancel it before starting a new one."
+        )
+        return
+
+    status_message = await message.reply_text("Checking Playlist URL, it'll take some time \n ⌛ Please Wait...")
     # Store the message ID for potential cancellation
     active_processes[user_id] = {"status_message_id": status_message.id, "cancelled": False}
     
