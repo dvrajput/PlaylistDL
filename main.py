@@ -8,6 +8,8 @@ from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 import logging
 import asyncio
+import requests
+from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
 from config import Config
 print(__version__)
 
@@ -73,40 +75,152 @@ def check_file_size(file_path):
 async def split_video(file_path, user_id, message):
     """Split large video into smaller parts"""
     base_name = os.path.basename(file_path)
-    name_without_ext = os.path.splitext(base_name)[0]
+    name_without_ext, extension = os.path.splitext(base_name)
     output_dir = f"downloads/{user_id}/split"
     
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     
-    # Each part will be ~1.8GB
-    part_size = "1800M"
+    # Maximum size for each part (1.8GB)
+    max_part_size = 1.8 * 1024 * 1024 * 1024
+    file_size = os.path.getsize(file_path)
     
-    await message.edit_text(f"File {base_name} is too large for Telegram. Splitting into smaller parts...")
+    # Calculate number of parts needed
+    num_parts = (file_size + max_part_size - 1) // max_part_size
+    
+    await message.edit_text(f"File {base_name} is too large for Telegram. Splitting into {num_parts} parts...")
     
     try:
-        # Use ffmpeg to split the video
-        cmd = [
-            'ffmpeg', '-i', file_path, 
-            '-c', 'copy', 
-            '-map', '0', 
-            '-segment_time', '00:30:00', 
-            '-f', 'segment', 
-            f"{output_dir}/{name_without_ext}_%03d.mp4"
-        ]
+        # Check if it's a video file
+        is_video = False
+        try:
+            # Use ffprobe to check if it's a video and get duration
+            cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file_path]
+            duration = float(subprocess.check_output(cmd).decode('utf-8').strip())
+            is_video = True
+        except:
+            is_video = False
         
-        subprocess.run(cmd, check=True)
+        split_files = []
         
-        # Get list of split files
-        split_files = sorted([
-            os.path.join(output_dir, f) 
-            for f in os.listdir(output_dir) 
-            if f.startswith(name_without_ext)
-        ])
+        if is_video:
+            # For video files, split by duration to achieve desired file sizes
+            # Calculate time segments based on file size ratio
+            segment_duration = duration / (file_size / max_part_size)
+            
+            start_time = 0
+            i = 1
+            
+            while start_time < duration:
+                parted_name = f"{name_without_ext}.part{i:03}{extension}"
+                out_path = os.path.join(output_dir, parted_name)
+                
+                # For the last part, use the remaining duration
+                if i == num_parts:
+                    # Use the remaining duration for the last part
+                    end_time = duration
+                else:
+                    # Calculate end time for this segment
+                    end_time = min(start_time + segment_duration, duration)
+                
+                segment_length = end_time - start_time
+                
+                # Use ffmpeg to split by time segments
+                cmd = [
+                    'ffmpeg', '-hide_banner', '-loglevel', 'error', 
+                    '-ss', str(start_time), 
+                    '-i', file_path,
+                    '-t', str(segment_length),
+                    '-c', 'copy', 
+                    '-avoid_negative_ts', '1',
+                    out_path
+                ]
+                
+                process = await asyncio.create_subprocess_exec(
+                    *cmd, 
+                    stderr=asyncio.subprocess.PIPE
+                )
+                
+                code = await process.wait()
+                
+                if code != 0:
+                    err = (await process.stderr.read()).decode().strip()
+                    logger.error(f"Error splitting video: {err}")
+                    
+                    # Try without some options if it failed
+                    cmd = [
+                        'ffmpeg', '-hide_banner', '-loglevel', 'error', 
+                        '-ss', str(start_time), 
+                        '-i', file_path,
+                        '-t', str(segment_length),
+                        '-c', 'copy', 
+                        out_path
+                    ]
+                    
+                    process = await asyncio.create_subprocess_exec(
+                        *cmd, 
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    
+                    code = await process.wait()
+                    
+                    if code != 0:
+                        err = (await process.stderr.read()).decode().strip()
+                        logger.error(f"Error splitting video (second attempt): {err}")
+                        return None
+                
+                # Check if the output file exists and has a valid size
+                if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    split_files.append(out_path)
+                    
+                    # Update progress
+                    await message.edit_text(f"Splitting {base_name}: Part {i}/{num_parts} completed ({format_size(os.path.getsize(out_path))})")
+                
+                # Move to next segment
+                start_time = end_time
+                i += 1
+                
+                # Break if we've created all needed parts
+                if i > num_parts:
+                    break
+        else:
+            # For non-video files, use the split command with exact byte sizes
+            # This will create parts of max_part_size bytes, except for the last part which will be smaller
+            out_path = os.path.join(output_dir, f"{name_without_ext}.")
+            
+            # Use the split command for non-video files
+            cmd = [
+                'split', '--numeric-suffixes=1', '--suffix-length=3',
+                f'--bytes={int(max_part_size)}', file_path, out_path
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            code = await process.wait()
+            
+            if code != 0:
+                err = (await process.stderr.read()).decode().strip()
+                logger.error(f"Error splitting file: {err}")
+                return None
+            
+            # Get list of split files
+            split_files = sorted([
+                os.path.join(output_dir, f) 
+                for f in os.listdir(output_dir)
+                if os.path.isfile(os.path.join(output_dir, f))
+            ])
+            
+            # Update progress for each part
+            for i, part_file in enumerate(split_files, 1):
+                part_size = os.path.getsize(part_file)
+                await message.edit_text(f"Split {base_name}: Part {i}/{len(split_files)} ({format_size(part_size)})")
         
         return split_files
     except Exception as e:
-        logger.error(f"Error splitting video: {str(e)}")
+        logger.error(f"Error splitting file: {str(e)}")
         return None
 
 async def progress(current, total, message, start_time, operation, filename=None, playlist_title=None, file_index=None, total_files=None):
@@ -146,9 +260,14 @@ async def progress(current, total, message, start_time, operation, filename=None
                         f"⏰ ETA: {format_time(eta)}"
                     )
                 
-                await message.edit_text(
-                    progress_text
-                )
+                # Store the last message text to compare
+                last_text = getattr(message, '_last_progress_text', '')
+                
+                # Only update if the text has changed
+                if progress_text != last_text:
+                    await message.edit_text(progress_text)
+                    # Store the new text
+                    message._last_progress_text = progress_text
                 
                 # Update last progress time for this message
                 last_progress_update[message.id] = now
@@ -158,6 +277,9 @@ async def progress(current, total, message, start_time, operation, filename=None
                     raise asyncio.CancelledError("Upload cancelled by user")
             except asyncio.CancelledError:
                 raise
+            except pyrogram.errors.exceptions.bad_request_400.MessageNotModified:
+                # Ignore this specific error
+                pass
             except Exception as e:
                 print(f"Progress update error: {str(e)}")
             
@@ -269,7 +391,33 @@ async def download_playlist(url, user_id, quality, message):
                 f"{i}/{total_videos} completed"
             )
 
-    return downloaded_files, playlist_title
+    # Show upload options after download is complete
+    if downloaded_files:
+        # Create keyboard with upload options
+        upload_keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📤 Upload to Telegram", callback_data=f"upload_telegram_{user_id}"),
+                InlineKeyboardButton("☁️ Upload to GoFile", callback_data=f"upload_gofile_{user_id}")
+            ],
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_process")]
+        ])
+        
+        await message.edit_text(
+            f"✅ Download completed!\n"
+            f"Playlist: {playlist_title}\n"
+            f"Total files: {len(downloaded_files)}\n\n"
+            f"Please select where to upload:",
+            reply_markup=upload_keyboard
+        )
+        
+        # Store download info for later use
+        user_data[user_id]['files'] = downloaded_files
+        user_data[user_id]['playlist_title'] = playlist_title
+        
+        return True
+    else:
+        await message.edit_text("Download failed. No files were downloaded.")
+        return False
 
 async def upload_videos_to_telegram(user_id, files, playlist_title, message):
     """Upload downloaded videos to Telegram"""
@@ -286,7 +434,7 @@ async def upload_videos_to_telegram(user_id, files, playlist_title, message):
         f"✅ Download completed!\n"
         f"Playlist: {playlist_title}\n"
         f"Total files: {len(files)}\n\n"
-        f"Starting upload to Telegram...",
+        f"Uploading to Telegram...",
         reply_markup=cancel_button
     )
     
@@ -303,8 +451,20 @@ async def upload_videos_to_telegram(user_id, files, playlist_title, message):
         try:
             filename = os.path.basename(file_path)
             
+            # Update main status message for current file
+            await message.edit_text(
+                f"📤 Uploading: {playlist_title}\n"
+                f"File {i}/{len(files)}: {filename}\n\n"
+                f"Processing...",
+                reply_markup=cancel_button
+            )
+            
             # Check if file is too large
             if check_file_size(file_path):
+                # Save the original message text to restore later
+                original_status = f"📤 Uploading: {playlist_title}\n" \
+                                 f"File {i}/{len(files)}: {filename}\n\n"
+                
                 # Split the video into parts
                 split_files = await split_video(file_path, user_id, message)
                 
@@ -312,9 +472,23 @@ async def upload_videos_to_telegram(user_id, files, playlist_title, message):
                     await app.send_message(user_id, f"Failed to split large file: {filename}")
                     continue
                 
+                # Restore original status message with additional info
+                await message.edit_text(
+                    f"{original_status}"
+                    f"Uploading {len(split_files)} split parts...",
+                    reply_markup=cancel_button
+                )
+                
                 # Upload each part
                 for part_index, part_file in enumerate(split_files, 1):
                     part_filename = os.path.basename(part_file)
+                    
+                    # Update main status with part info
+                    await message.edit_text(
+                        f"{original_status}"
+                        f"Uploading part {part_index}/{len(split_files)}...",
+                        reply_markup=cancel_button
+                    )
                     
                     # Get video duration if possible
                     try:
@@ -346,6 +520,14 @@ async def upload_videos_to_telegram(user_id, files, playlist_title, message):
                     
                     # Delete progress message after upload
                     await progress_message.delete()
+                
+                # Update status after all parts are uploaded
+                await message.edit_text(
+                    f"📤 Uploading: {playlist_title}\n"
+                    f"File {i}/{len(files)}: {filename}\n\n"
+                    f"✅ All {len(split_files)} parts uploaded successfully!",
+                    reply_markup=cancel_button
+                )
             else:
                 # Regular upload for normal sized files
                 # Get video duration if possible
@@ -378,6 +560,14 @@ async def upload_videos_to_telegram(user_id, files, playlist_title, message):
                 
                 # Delete progress message after upload
                 await progress_message.delete()
+                
+                # Update main status message
+                await message.edit_text(
+                    f"📤 Uploading: {playlist_title}\n"
+                    f"File {i}/{len(files)}: {filename}\n\n"
+                    f"✅ Uploaded successfully!",
+                    reply_markup=cancel_button
+                )
             
         except Exception as e:
             logger.error(f"Error uploading file {file_path}: {str(e)}")
@@ -396,6 +586,235 @@ async def upload_videos_to_telegram(user_id, files, playlist_title, message):
         f"Playlist: {playlist_title}\n"
         f"All {len(files)} videos have been uploaded."
     )
+
+async def upload_to_gofile(file_path, message, current_video_title):
+    """Upload a file to GoFile"""
+    try:
+        server_url = "https://api.gofile.io/servers"
+        server_response = requests.get(server_url)
+        
+        if server_response.status_code != 200:
+            raise Exception(f"Failed to get server. Status code: {server_response.status_code}")
+        
+        server_data = server_response.json()
+        server = server_data["data"]["servers"][0]["name"]
+
+        upload_url = f"https://{server}.gofile.io/uploadFile"
+
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+        
+        token = Config.GOFILE_TOKEN
+
+        file_size = os.path.getsize(file_path)
+        start_time = time.time()
+        last_update_time = start_time
+        update_interval = 5  # Reduced to 5 seconds for more frequent updates
+
+        def progress_callback(monitor):
+            nonlocal last_update_time
+            current_time = time.time()
+            
+            if current_time - last_update_time >= update_interval:
+                try:
+                    percentage = (monitor.bytes_read * 100) / monitor.len
+                    filled = int(percentage / 10)
+                    bar = '█' * filled + '░' * (10 - filled)
+                    speed = monitor.bytes_read / (current_time - start_time)
+                    
+                    # Format sizes
+                    current_mb = monitor.bytes_read / (1024 * 1024)
+                    total_mb = monitor.len / (1024 * 1024)
+                    speed_mb = speed / (1024 * 1024)
+                    
+                    # Calculate ETA
+                    remaining_bytes = monitor.len - monitor.bytes_read
+                    eta = remaining_bytes / speed if speed > 0 else 0
+                    
+                    progress_text = (
+                        f"📤 Uploading to Gofile...\n\n"
+                        f"📁 File: {current_video_title}\n"
+                        f"{bar} {percentage:.1f}%\n\n"
+                        f"⌛ Uploaded: {current_mb:.1f}/{total_mb:.1f} MB\n"
+                        f"⚡️ Speed: {speed_mb:.2f} MB/s\n"
+                        f"⏰ ETA: {format_time(eta)}"
+                    )
+
+                    # Add cancel button
+                    cancel_button = {
+                        "reply_markup": {
+                            "inline_keyboard": [[{
+                                "text": "❌ Cancel",
+                                "callback_data": f"cancel_{message.id}"
+                            }]]
+                        }
+                    }
+                    
+                    requests.post(
+                        f"https://api.telegram.org/bot{Config.BOT_TOKEN}/editMessageText",
+                        json={
+                            "chat_id": message.chat.id,
+                            "message_id": message.id,
+                            "text": progress_text,
+                            "reply_markup": cancel_button["reply_markup"]
+                        }
+                    )
+                    # Check if upload was cancelled
+                    if upload_cancelled.get(message.id, False):
+                        print("Upload cancelled by user")
+                        try:
+                            if os.path.exists(file_path):
+                                os.remove(file_path)
+                        except Exception as e:
+                            print(f"Error cleaning up file: {str(e)}")
+                        # Raise StopIteration to actually stop the upload
+                        raise StopIteration("Upload cancelled by user")
+
+                    last_update_time = current_time
+                except StopIteration:
+                    raise
+                except Exception as e:
+                    print(f"Progress update error: {str(e)}")
+
+        try:
+            safe_filename = os.path.basename(file_path).encode('ascii', 'ignore').decode('ascii')
+            # Include folderId in the upload
+            fields = {
+                'file': (safe_filename, open(file_path, 'rb'), 'application/octet-stream')
+            }
+            encoder = MultipartEncoder(fields=fields)
+            monitor = MultipartEncoderMonitor(encoder, callback=progress_callback)
+
+            try:
+                response = requests.post(
+                    upload_url,
+                    data=monitor,
+                    headers={'Content-Type': monitor.content_type,
+                            'Authorization': f"Bearer {token}"},
+                    timeout=3600
+                )
+            except StopIteration:
+                print("Upload stopped by user")
+                return None
+
+            # Check if cancelled after upload
+            if upload_cancelled.get(message.id, False):
+                print("Upload cancelled by user")
+                return None
+                
+            if response.status_code != 200:
+                raise Exception(f"Upload failed with status code: {response.status_code}")
+
+            result = response.json()
+
+            if result["status"] == "ok":
+                return result["data"]["downloadPage"]
+            return None
+
+        except Exception as e:
+            if "Upload cancelled by user" in str(e):
+                return None
+            raise
+    except Exception as e:
+        print(f"GoFile upload error: {str(e)}")
+        return None
+    finally:
+        try:
+            if 'encoder' in locals() and hasattr(encoder.fields['file'][1], 'close'):
+                encoder.fields['file'][1].close()
+        except:
+            pass
+
+async def upload_files_to_gofile(user_id, files, playlist_title, message):
+    """Upload all downloaded files to GoFile"""
+    # Add cancel button to the status message
+    cancel_button = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel Process", callback_data="cancel_process")]
+    ])
+    
+    await message.edit_text(
+        f"✅ Preparing to upload to GoFile!\n"
+        f"Playlist: {playlist_title}\n"
+        f"Total files: {len(files)}\n\n"
+        f"Creating folder...",
+        reply_markup=cancel_button
+    )
+    
+    # Track uploaded files and their links
+    uploaded_files = []
+    gofile_links = []
+    
+    for i, file_path in enumerate(files, 1):
+        # Check if process was cancelled
+        if active_processes.get(user_id, {}).get("cancelled", False):
+            await message.edit_text("Process cancelled by user.")
+            # Clean up downloaded files
+            cleanup_path = f"downloads/{user_id}"
+            if os.path.exists(cleanup_path):
+                shutil.rmtree(cleanup_path)
+            return
+            
+        try:
+            filename = os.path.basename(file_path)
+            
+            # Update status message
+            await message.edit_text(
+                f"📤 Uploading to GoFile: {playlist_title}\n"
+                f"File {i}/{len(files)}: {filename}\n\n"
+                f"Starting upload...",
+                reply_markup=cancel_button
+            )
+            
+            # Upload file to GoFile
+            download_link = await upload_to_gofile(file_path, message, filename)
+            
+            if download_link:
+                uploaded_files.append(filename)
+                gofile_links.append(download_link)
+                
+                # Update status message
+                await message.edit_text(
+                    f"📤 Uploading to GoFile: {playlist_title}\n"
+                    f"File {i}/{len(files)}: {filename}\n\n"
+                    f"✅ Upload successful!\n"
+                    f"Link: {download_link}",
+                    reply_markup=cancel_button
+                )
+            else:
+                await message.edit_text(
+                    f"📤 Uploading to GoFile: {playlist_title}\n"
+                    f"File {i}/{len(files)}: {filename}\n\n"
+                    f"❌ Upload failed.",
+                    reply_markup=cancel_button
+                )
+        
+        except Exception as e:
+            logger.error(f"Error uploading file to GoFile {file_path}: {str(e)}")
+            await app.send_message(user_id, f"Failed to upload {filename} to GoFile: {str(e)}")
+    
+    # Remove user from active processes
+    active_processes.pop(user_id, None)
+    
+    # Clean up downloaded files
+    cleanup_path = f"downloads/{user_id}"
+    if os.path.exists(cleanup_path):
+        shutil.rmtree(cleanup_path)
+    
+    # Final message with all links
+    if gofile_links:
+        links_text = "\n\n".join([f"{i+1}. {filename}: {link}" for i, (filename, link) in enumerate(zip(uploaded_files, gofile_links))])
+        await message.edit_text(
+            f"✅ GoFile upload completed!\n"
+            f"Playlist: {playlist_title}\n"
+            f"Total files uploaded: {len(uploaded_files)}/{len(files)}\n\n"
+            f"Download links:\n{links_text}"
+        )
+    else:
+        await message.edit_text(
+            f"❌ GoFile upload failed!\n"
+            f"Playlist: {playlist_title}\n"
+            f"No files were uploaded successfully."
+        )
 
 @app.on_message(filters.command("start"))
 async def start_command(client, message):
@@ -482,16 +901,47 @@ async def handle_quality_selection(client, callback_query: CallbackQuery):
             f"Starting download process with {quality}p quality..."
         )
         
-        files, playlist_title = await download_playlist(url, user_id, quality, callback_query.message)
+        # Download the playlist but don't upload yet - let user choose upload method
+        result = await download_playlist(url, user_id, quality, callback_query.message)
         
-        if files and not active_processes.get(user_id, {}).get("cancelled", False):
-            await upload_videos_to_telegram(user_id, files, playlist_title, callback_query.message)
-            cleanup_path = f"downloads/{user_id}"
-            if os.path.exists(cleanup_path):
-                shutil.rmtree(cleanup_path)
-        elif not files:
-            await callback_query.message.edit_text("Download failed. Please try again.")
+        # If download failed or was cancelled
+        if not result:
+            if not active_processes.get(user_id, {}).get("cancelled", False):
+                await callback_query.message.edit_text("Download failed. Please try again.")
             active_processes.pop(user_id, None)
+            
+@app.on_callback_query(filters.regex(r'^upload_(telegram|gofile)_\d+$'))
+async def handle_upload_selection(client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    data = callback_query.data
+    
+    # Extract upload type and user ID from callback data
+    upload_type, target_user_id = data.split('_')[1], int(data.split('_')[2])
+    
+    # Verify this is the correct user
+    if user_id != target_user_id:
+        await callback_query.answer("This is not your download.")
+        return
+    
+    if user_id not in user_data or 'files' not in user_data[user_id]:
+        await callback_query.answer("Session expired. Please start over.")
+        return
+    
+    files = user_data[user_id]['files']
+    playlist_title = user_data[user_id]['playlist_title']
+    
+    # Make sure user is in active processes
+    if user_id not in active_processes:
+        active_processes[user_id] = {"status_message_id": callback_query.message.id, "cancelled": False}
+    
+    await callback_query.answer(f"Starting upload to {upload_type.capitalize()}...")
+    
+    if upload_type == 'telegram':
+        # Use existing function for Telegram uploads
+        await upload_videos_to_telegram(user_id, files, playlist_title, callback_query.message)
+    else:  # GoFile
+        # Use new function for GoFile uploads
+        await upload_files_to_gofile(user_id, files, playlist_title, callback_query.message)
 
 # You need to add a separate callback handler for cancel_process
 @app.on_callback_query(filters.regex(r'^cancel_process$'))
