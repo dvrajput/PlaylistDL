@@ -611,6 +611,7 @@ async def upload_to_gofile(file_path, message, current_video_title, folder_id=No
         last_update_time = start_time
         update_interval = 5  # Reduced to 5 seconds for more frequent updates
 
+        # Progress callback function remains unchanged
         def progress_callback(monitor):
             nonlocal last_update_time
             current_time = time.time()
@@ -685,7 +686,7 @@ async def upload_to_gofile(file_path, message, current_video_title, folder_id=No
             
             # Add folder ID if provided
             if folder_id:
-                fields['folderId'] = folder_id
+                fields['folderId'] = (None, folder_id)  # Fix: Properly format multipart form data
                 
             encoder = MultipartEncoder(fields=fields)
             monitor = MultipartEncoderMonitor(encoder, callback=progress_callback)
@@ -708,13 +709,15 @@ async def upload_to_gofile(file_path, message, current_video_title, folder_id=No
                 return None
                 
             if response.status_code != 200:
-                raise Exception(f"Upload failed with status code: {response.status_code}")
+                raise Exception(f"Upload failed with status code: {response.status_code}, Response: {response.text}")
 
             result = response.json()
-
-            if result["status"] == "ok":
+            
+            if result["status"] == "ok" and isinstance(result["data"], dict):  # Fix: Check if data is a dictionary
                 return result["data"]
-            return None
+            else:
+                print(f"Unexpected response format: {result}")
+                return None
 
         except Exception as e:
             if "Upload cancelled by user" in str(e):
@@ -733,26 +736,64 @@ async def upload_to_gofile(file_path, message, current_video_title, folder_id=No
 async def create_gofile_folder(name, token):
     """Create a folder in GoFile"""
     try:
-        url = "https://api.gofile.io/createFolder"
+        # First get the account ID
+        account_id_url = "https://api.gofile.io/accounts/getid"
+        headers = {
+            "Authorization": f"Bearer {token}"
+        }
+        
+        account_response = requests.get(account_id_url, headers=headers)
+        
+        if account_response.status_code != 200:
+            raise Exception(f"Failed to get account ID. Status code: {account_response.status_code}, Response: {account_response.text}")
+            
+        account_data = account_response.json()
+        
+        if account_data["status"] != "ok":
+            raise Exception(f"Failed to get account ID: {account_data.get('message', 'Unknown error')}")
+        
+        # Get the account ID
+        account_id = account_data["data"]["id"]
+        
+        # Get the root folder ID for this account
+        account_details_url = f"https://api.gofile.io/accounts/{account_id}"
+        account_details_response = requests.get(account_details_url, headers=headers)
+        
+        if account_details_response.status_code != 200:
+            raise Exception(f"Failed to get account details. Status code: {account_details_response.status_code}")
+            
+        account_details = account_details_response.json()
+        
+        if account_details["status"] != "ok":
+            raise Exception(f"Failed to get account details: {account_details.get('message', 'Unknown error')}")
+        
+        # Get the root folder ID
+        root_folder_id = account_details["data"]["rootFolder"]
+        
+        # Now create the folder with the root folder ID
+        url = "https://api.gofile.io/contents/createFolder"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {token}"
         }
         data = {
-            "parentFolderId": "root",
+            "parentFolderId": root_folder_id,
             "folderName": name
         }
+        
+        print(f"Creating folder with data: {data}")
         
         response = requests.post(url, headers=headers, json=data)
         
         if response.status_code != 200:
-            raise Exception(f"Failed to create folder. Status code: {response.status_code}")
+            raise Exception(f"Failed to create folder. Status code: {response.status_code}, Response: {response.text}")
             
         result = response.json()
         
         if result["status"] == "ok":
             return result["data"]["id"]
-        return None
+        else:
+            raise Exception(f"Failed to create folder: {result.get('message', 'Unknown error')}")
     except Exception as e:
         print(f"Error creating GoFile folder: {str(e)}")
         return None
@@ -815,7 +856,12 @@ async def upload_files_to_gofile(user_id, files, playlist_title, message):
                 uploaded_files.append(filename)
                 # Store folder link from the first successful upload
                 if not folder_link and "parentFolder" in result:
-                    folder_link = result["parentFolder"]["directLink"]
+                    # Fix: Check if parentFolder is a dictionary and has directLink
+                    if isinstance(result["parentFolder"], dict) and "directLink" in result["parentFolder"]:
+                        folder_link = result["parentFolder"]["directLink"]
+                    # If parentFolder is a string (folder ID) or doesn't have directLink
+                    elif "parentFolderCode" in result:
+                        folder_link = f"https://gofile.io/d/{result['parentFolderCode']}"
                 
                 # Update status message
                 await message.edit_text(
@@ -845,6 +891,10 @@ async def upload_files_to_gofile(user_id, files, playlist_title, message):
         shutil.rmtree(cleanup_path)
     
     # Final message with folder link
+    if not folder_link and len(uploaded_files) > 0 and "parentFolderCode" in result:
+        # Fallback to using parentFolderCode if we couldn't get directLink
+        folder_link = f"https://gofile.io/d/{result['parentFolderCode']}"
+        
     if folder_link and uploaded_files:
         await message.edit_text(
             f"✅ GoFile upload completed!\n"
@@ -858,8 +908,6 @@ async def upload_files_to_gofile(user_id, files, playlist_title, message):
             f"Playlist: {playlist_title}\n"
             f"No files were uploaded successfully."
         )
-
-# ... existing code ...
 
 @app.on_callback_query(filters.regex(r'^cancel_process$'))
 async def cancel_process(client, callback_query):
@@ -1008,17 +1056,6 @@ async def handle_upload_selection(client, callback_query: CallbackQuery):
     else:  # GoFile
         # Use new function for GoFile uploads
         await upload_files_to_gofile(user_id, files, playlist_title, callback_query.message)
-
-# You need to add a separate callback handler for cancel_process
-@app.on_callback_query(filters.regex(r'^cancel_process$'))
-async def cancel_process(client, callback_query):
-    user_id = callback_query.from_user.id
-    
-    if user_id in active_processes:
-        active_processes[user_id]["cancelled"] = True
-        await callback_query.answer("Process will be cancelled soon.")
-    else:
-        await callback_query.answer("No active process to cancel.")
 
 # Then modify your existing cancel_upload function to only handle numeric IDs
 @app.on_callback_query(filters.regex(r'^cancel_\d+$'))
