@@ -587,7 +587,7 @@ async def upload_videos_to_telegram(user_id, files, playlist_title, message):
         f"All {len(files)} videos have been uploaded."
     )
 
-async def upload_to_gofile(file_path, message, current_video_title):
+async def upload_to_gofile(file_path, message, current_video_title, folder_id=None):
     """Upload a file to GoFile"""
     try:
         server_url = "https://api.gofile.io/servers"
@@ -678,10 +678,15 @@ async def upload_to_gofile(file_path, message, current_video_title):
 
         try:
             safe_filename = os.path.basename(file_path).encode('ascii', 'ignore').decode('ascii')
-            # Include folderId in the upload
+            # Include folderId in the upload if provided
             fields = {
                 'file': (safe_filename, open(file_path, 'rb'), 'application/octet-stream')
             }
+            
+            # Add folder ID if provided
+            if folder_id:
+                fields['folderId'] = folder_id
+                
             encoder = MultipartEncoder(fields=fields)
             monitor = MultipartEncoderMonitor(encoder, callback=progress_callback)
 
@@ -708,7 +713,7 @@ async def upload_to_gofile(file_path, message, current_video_title):
             result = response.json()
 
             if result["status"] == "ok":
-                return result["data"]["downloadPage"]
+                return result["data"]
             return None
 
         except Exception as e:
@@ -725,6 +730,33 @@ async def upload_to_gofile(file_path, message, current_video_title):
         except:
             pass
 
+async def create_gofile_folder(name, token):
+    """Create a folder in GoFile"""
+    try:
+        url = "https://api.gofile.io/createFolder"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}"
+        }
+        data = {
+            "parentFolderId": "root",
+            "folderName": name
+        }
+        
+        response = requests.post(url, headers=headers, json=data)
+        
+        if response.status_code != 200:
+            raise Exception(f"Failed to create folder. Status code: {response.status_code}")
+            
+        result = response.json()
+        
+        if result["status"] == "ok":
+            return result["data"]["id"]
+        return None
+    except Exception as e:
+        print(f"Error creating GoFile folder: {str(e)}")
+        return None
+
 async def upload_files_to_gofile(user_id, files, playlist_title, message):
     """Upload all downloaded files to GoFile"""
     # Add cancel button to the status message
@@ -740,9 +772,20 @@ async def upload_files_to_gofile(user_id, files, playlist_title, message):
         reply_markup=cancel_button
     )
     
+    # Create a folder for the playlist
+    token = Config.GOFILE_TOKEN
+    folder_id = await create_gofile_folder(playlist_title, token)
+    
+    if not folder_id:
+        await message.edit_text(
+            f"❌ Failed to create folder on GoFile.\n"
+            f"Please try again later."
+        )
+        return
+    
     # Track uploaded files and their links
     uploaded_files = []
-    gofile_links = []
+    folder_link = None
     
     for i, file_path in enumerate(files, 1):
         # Check if process was cancelled
@@ -765,19 +808,20 @@ async def upload_files_to_gofile(user_id, files, playlist_title, message):
                 reply_markup=cancel_button
             )
             
-            # Upload file to GoFile
-            download_link = await upload_to_gofile(file_path, message, filename)
+            # Upload file to GoFile with folder ID
+            result = await upload_to_gofile(file_path, message, filename, folder_id)
             
-            if download_link:
+            if result:
                 uploaded_files.append(filename)
-                gofile_links.append(download_link)
+                # Store folder link from the first successful upload
+                if not folder_link and "parentFolder" in result:
+                    folder_link = result["parentFolder"]["directLink"]
                 
                 # Update status message
                 await message.edit_text(
                     f"📤 Uploading to GoFile: {playlist_title}\n"
                     f"File {i}/{len(files)}: {filename}\n\n"
-                    f"✅ Upload successful!\n"
-                    f"Link: {download_link}",
+                    f"✅ Upload successful!",
                     reply_markup=cancel_button
                 )
             else:
@@ -800,14 +844,13 @@ async def upload_files_to_gofile(user_id, files, playlist_title, message):
     if os.path.exists(cleanup_path):
         shutil.rmtree(cleanup_path)
     
-    # Final message with all links
-    if gofile_links:
-        links_text = "\n\n".join([f"{i+1}. {filename}: {link}" for i, (filename, link) in enumerate(zip(uploaded_files, gofile_links))])
+    # Final message with folder link
+    if folder_link and uploaded_files:
         await message.edit_text(
             f"✅ GoFile upload completed!\n"
             f"Playlist: {playlist_title}\n"
             f"Total files uploaded: {len(uploaded_files)}/{len(files)}\n\n"
-            f"Download links:\n{links_text}"
+            f"Download link (all files in one folder):\n{folder_link}"
         )
     else:
         await message.edit_text(
@@ -815,6 +858,29 @@ async def upload_files_to_gofile(user_id, files, playlist_title, message):
             f"Playlist: {playlist_title}\n"
             f"No files were uploaded successfully."
         )
+
+# ... existing code ...
+
+@app.on_callback_query(filters.regex(r'^cancel_process$'))
+async def cancel_process(client, callback_query):
+    user_id = callback_query.from_user.id
+    
+    if user_id in active_processes:
+        active_processes[user_id]["cancelled"] = True
+        # Immediately update the message to show cancellation
+        await callback_query.message.edit_text("Process cancelled by user.")
+        
+        # Clean up downloaded files
+        cleanup_path = f"downloads/{user_id}"
+        if os.path.exists(cleanup_path):
+            shutil.rmtree(cleanup_path)
+            
+        # Remove from active processes
+        active_processes.pop(user_id, None)
+        
+        await callback_query.answer("Process cancelled successfully.")
+    else:
+        await callback_query.answer("No active process to cancel.")
 
 @app.on_message(filters.command("start"))
 async def start_command(client, message):
@@ -909,7 +975,7 @@ async def handle_quality_selection(client, callback_query: CallbackQuery):
             if not active_processes.get(user_id, {}).get("cancelled", False):
                 await callback_query.message.edit_text("Download failed. Please try again.")
             active_processes.pop(user_id, None)
-            
+
 @app.on_callback_query(filters.regex(r'^upload_(telegram|gofile)_\d+$'))
 async def handle_upload_selection(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
@@ -959,7 +1025,9 @@ async def cancel_process(client, callback_query):
 async def cancel_upload(client, callback_query):
     message_id = int(callback_query.data.split('_')[1])
     upload_cancelled[message_id] = True
-    await callback_query.answer("Upload will be cancelled")
+    # Immediately update the message
+    await callback_query.message.edit_text("Upload cancelled by user.")
+    await callback_query.answer("Upload cancelled successfully")
 
 if __name__ == "__main__":
     if not os.path.exists("downloads"):
