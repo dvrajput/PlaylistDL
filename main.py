@@ -639,6 +639,26 @@ async def upload_videos_to_telegram(user_id, files, playlist_title, message):
         f"Playlist: {playlist_title}\n"
         f"All {len(files)} videos have been uploaded."
     )
+    # Log successful Telegram upload
+    try:
+        user = await app.get_users(user_id)
+        user_mention = f"@{user.username}" if user.username else f"[{user.first_name}](tg://user?id={user_id})"
+        
+        # Get the original URL from user_data
+        original_url = user_data.get(user_id, {}).get('url', 'Unknown URL')
+        
+        log_message = (
+            "#PlaylistBotLogs \n"
+            f"✅ Telegram upload completed!\n"
+            f"👤 User: {user_mention}\n"
+            f"🆔 ID: `{user_id}`\n"
+            f"📋 Playlist: {playlist_title}\n"
+            f"📁 Files: {len(files)}\n"
+            f"🔗 YouTube URL: {original_url}"
+        )
+        await send_log(log_message)
+    except Exception as e:
+        logger.error(f"Failed to send upload completion log: {str(e)}")
 
 async def upload_to_gofile(file_path, message, current_video_title, folder_id=None):
     """Upload a file to GoFile"""
@@ -958,12 +978,47 @@ async def upload_files_to_gofile(user_id, files, playlist_title, message):
             f"Total files uploaded: {len(uploaded_files)}/{len(files)}\n\n"
             f"Download link (all files in one folder):\n{folder_link}"
         )
+         # Log successful GoFile upload
+        try:
+            user = await app.get_users(user_id)
+            user_mention = f"@{user.username}" if user.username else f"[{user.first_name}](tg://user?id={user_id})"
+            
+            # Get the original URL from user_data
+            original_url = user_data.get(user_id, {}).get('url', 'Unknown URL')
+            
+            log_message = (
+                "#PlaylistBotLogs \n"
+                f"✅ GoFile upload completed!\n"
+                f"👤 User: {user_mention}\n"
+                f"🆔 ID: `{user_id}`\n"
+                f"📋 Playlist: {playlist_title}\n"
+                f"📁 Files: {len(uploaded_files)}/{len(files)}\n"
+                f"🔗 YouTube URL: {original_url}\n"
+                f"📥 GoFile Link: {folder_link}"
+            )
+            await send_log(log_message)
+        except Exception as e:
+            logger.error(f"Failed to send upload completion log: {str(e)}")
     else:
         await message.edit_text(
             f"❌ GoFile upload failed!\n"
             f"Playlist: {playlist_title}\n"
             f"No files were uploaded successfully."
         )
+        # Log failed upload
+        try:
+            user = await app.get_users(user_id)
+            user_mention = f"@{user.username}" if user.username else f"[{user.first_name}](tg://user?id={user_id})"
+            log_message = (
+                "#PlaylistBotLogs \n"
+                f"❌ GoFile upload failed!\n"
+                f"👤 User: {user_mention}\n"
+                f"🆔 ID: `{user_id}`\n"
+                f"📋 Playlist: {playlist_title}"
+            )
+            await send_log(log_message)
+        except Exception as e:
+            logger.error(f"Failed to send upload failure log: {str(e)}")
 
 @app.on_callback_query(filters.regex(r'^cancel_process$'))
 async def cancel_process(client, callback_query):
@@ -1000,6 +1055,10 @@ async def start_command(client, message):
         admin_button = InlineKeyboardMarkup([
             [InlineKeyboardButton("Contact Admin", url=f"https://t.me/{Config.ADMIN_USERNAME}")]
         ])
+         # Log unauthorized access attempt
+        user_mention = f"@{message.from_user.username}" if message.from_user.username else f"[{message.from_user.first_name}](tg://user?id={user_id})"
+        log_message = "#PlaylistBotLogs \n" f"⚠️ Unauthorized access attempt!\n👤 User: {user_mention}\n🆔 ID: `{user_id}`"
+        await send_log(log_message)
         
         await message.reply_text(
             "You are not authorized to use this bot.\n"
@@ -1019,6 +1078,11 @@ async def handle_url(client, message):
         admin_button = InlineKeyboardMarkup([
             [InlineKeyboardButton("Contact Admin", url=f"https://t.me/{Config.ADMIN_USERNAME}")]
         ])
+
+        # Log unauthorized access attempt
+        user_mention = f"@{message.from_user.username}" if message.from_user.username else f"[{message.from_user.first_name}](tg://user?id={user_id})"
+        log_message = "#PlaylistBotLogs \n" f"⚠️ Unauthorized URL request!\n👤 User: {user_mention}\n🆔 ID: `{user_id}`\n🔗 URL: {url}"
+        await send_log(log_message)
         
         await message.reply_text(
             "You are not authorized to use this bot.\n"
@@ -1070,6 +1134,18 @@ async def handle_url(client, message):
     playlist_title = playlist_info.get('title', 'Unknown Playlist')
     total_videos = len(playlist_info['entries'])
     
+    user_mention = f"@{message.from_user.username}" if message.from_user.username else f"[{message.from_user.first_name}](tg://user?id={user_id})"
+    log_message = (
+        "#PlaylistBotLogs \n"
+        f"🚀 New download task started!\n"
+        f"👤 User: {user_mention}\n"
+        f"🆔 ID: `{user_id}`\n"
+        f"📋 Playlist: {playlist_title}\n"
+        f"📊 Videos: {total_videos}\n"
+        f"🔗 URL: {url}"
+    )
+    await send_log(log_message)
+
     await status_message.edit_text(
         f"📋 Playlist: {playlist_title}\n"
         f"📊 Total videos: {total_videos}\n\n"
@@ -1225,6 +1301,19 @@ async def list_auth_command(client, message):
             auth_list.append(user_info)
         
         await message.reply_text(f"Authorized users:\n{chr(10).join(auth_list)}")
+
+async def send_log(message, disable_notification=False):
+    """Send log message to the configured log channel"""
+    if Config.LOG_CHANNEL != 0:
+        try:
+            await app.send_message(
+                chat_id=Config.LOG_CHANNEL,
+                text=message,
+                disable_notification=disable_notification,
+                link_preview_options=LinkPreviewOptions(is_disabled=True)
+            )
+        except Exception as e:
+            logger.error(f"Failed to send log message: {str(e)}")
 
 if __name__ == "__main__":
     if not os.path.exists("downloads"):

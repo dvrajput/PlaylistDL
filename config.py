@@ -12,3 +12,4 @@ class Config:
     OWNER_ID = int(os.getenv("OWNER_ID"))
     UPLOAD_INTERVAL = int(os.getenv("UPLOAD_INTERVAL"))
     ADMIN_USERNAME = os.getenv("ADMIN_USERNAME")
+    LOG_CHANNEL = int(os.getenv("LOG_CHANNEL"))
