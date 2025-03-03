@@ -1315,6 +1315,52 @@ async def send_log(message, disable_notification=False):
         except Exception as e:
             logger.error(f"Failed to send log message: {str(e)}")
 
+@app.on_message(filters.command("setcookies") & filters.user(OWNER_ID))
+async def set_cookies_command(client, message):
+    """Set YouTube cookies from message text (Owner only)"""
+    try:
+        # Check if command is a reply to a message
+        if not message.reply_to_message or not message.reply_to_message.text:
+            await message.reply_text(
+                "❌ Please reply to a message containing cookies with /setcookies command",
+                quote=True
+            )
+            return
+
+        cookies_content = message.reply_to_message.text.strip()
+        
+        # Basic validation
+        if not any(domain in cookies_content.lower() for domain in ['.youtube.com', 'youtube.com']):
+            await message.reply_text(
+                "❌ Invalid cookies content. Must contain YouTube cookies.",
+                quote=True
+            )
+            return
+
+        # Write cookies to file
+        try:
+            with open("cookies.txt", 'w', encoding='utf-8') as f:
+                f.write(cookies_content)
+                
+            await message.reply_text(
+                "✅ Cookies updated successfully!",
+                quote=True
+            )
+            
+        except Exception as e:
+            await message.reply_text(
+                f"❌ Error saving cookies: {str(e)}",
+                quote=True
+            )
+            
+    except Exception as e:
+        # Replace handle_error with direct error handling
+        logger.error(f"Error in set_cookies_command: {str(e)}")
+        await message.reply_text(
+            f"❌ An error occurred: {str(e)}",
+            quote=True
+        )
+        
 if __name__ == "__main__":
     if not os.path.exists("downloads"):
         os.makedirs("downloads")
