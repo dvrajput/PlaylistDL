@@ -363,7 +363,35 @@ def download_video(video_url, download_path, quality):
         except Exception as e:
             logger.error(f"Error downloading video: {str(e)}")
             return None
-    
+
+def download_audio(video_url, download_path, format_type):
+    """Download a single video as audio with specified format (mp3 or wav)"""
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': os.path.join(download_path, '%(title)s.%(ext)s'),
+        'cookiefile': 'cookies.txt',
+        'ignoreerrors': True,
+        'no_warnings': True,
+        'quiet': True,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': format_type,
+            'preferredquality': '192',
+        }],
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            ydl.download([video_url])
+            info = ydl.extract_info(video_url, download=False)
+            filename = ydl.prepare_filename(info)
+            # Change extension to match the requested format
+            filename = os.path.splitext(filename)[0] + f".{format_type}"
+            return filename
+        except Exception as e:
+            logger.error(f"Error downloading audio: {str(e)}")
+            return None
+
 async def download_playlist(url, user_id, quality, message):
     """Download videos from playlist with specified quality"""
     download_path = create_download_folder(user_id)
@@ -464,6 +492,9 @@ async def upload_videos_to_telegram(user_id, files, playlist_title, message):
         reply_markup=cancel_button
     )
     
+    # Check if we're dealing with audio files
+    is_audio = user_data.get(user_id, {}).get('is_audio', False)
+    
     for i, file_path in enumerate(files, 1):
         # Check if process was cancelled
         if active_processes.get(user_id, {}).get("cancelled", False):
@@ -485,82 +516,115 @@ async def upload_videos_to_telegram(user_id, files, playlist_title, message):
                 reply_markup=cancel_button
             )
             
-            # Check if file is too large
+                        # Check if file is too large
             if check_file_size(file_path):
-                # Save the original message text to restore later
-                original_status = f"📤 Uploading: {playlist_title}\n" \
-                                 f"File {i}/{len(files)}: {filename}\n\n"
-                
-                # Split the video into parts
-                split_files = await split_video(file_path, user_id, message)
-                
-                if not split_files:
-                    await app.send_message(user_id, f"Failed to split large file: {filename}")
-                    continue
-                
-                # Restore original status message with additional info
-                await message.edit_text(
-                    f"{original_status}"
-                    f"Uploading {len(split_files)} split parts...",
-                    reply_markup=cancel_button
-                )
-                
-                # Upload each part
-                for part_index, part_file in enumerate(split_files, 1):
-                    part_filename = os.path.basename(part_file)
-                    
-                    # Update main status with part info
+                # For large files, handle differently based on type
+                if is_audio:
+                    # For audio, we'll just upload as document since splitting audio is less common
                     await message.edit_text(
-                        f"{original_status}"
-                        f"Uploading part {part_index}/{len(split_files)}...",
+                        f"📤 Uploading: {playlist_title}\n"
+                        f"File {i}/{len(files)}: {filename}\n\n"
+                        f"File is large, uploading as document...",
                         reply_markup=cancel_button
                     )
-                    
-                    # Get video duration if possible
-                    try:
-                        duration_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', part_file]
-                        duration = int(float(subprocess.check_output(duration_cmd).decode('utf-8').strip()))
-                    except:
-                        duration = 0
                     
                     # Create a new message for progress tracking
                     progress_message = await app.send_message(
                         user_id,
-                        f"Starting upload: {part_filename} (Part {part_index}/{len(split_files)})"
+                        f"Starting upload: {filename}"
                     )
                     
                     # Start time for progress
                     start_time = time.time()
                     
                     # Upload with progress
-                    await app.send_video(
+                    await app.send_document(
                         user_id,
-                        part_file,
-                        caption=f"{filename} - Part {part_index}/{len(split_files)}\n\nFrom playlist: {playlist_title}",
-                        supports_streaming=True,
-                        duration=duration,
+                        file_path,
+                        caption=f"{filename}\n\nFrom playlist: {playlist_title}",
                         thumb=thumbnail_path if has_thumbnail else None,
                         progress=progress,
-                        progress_args=(progress_message, start_time, "upload", part_filename, playlist_title, i, len(files))
+                        progress_args=(progress_message, start_time, "upload", filename, playlist_title, i, len(files))
                     )
                     
                     # Delete progress message after upload
                     await progress_message.delete()
+                else:
+                    # For videos, use the existing split video function
+                    # Save the original message text to restore later
+                    original_status = f"📤 Uploading: {playlist_title}\n" \
+                                    f"File {i}/{len(files)}: {filename}\n\n"
+                    
+                    # Split the video into parts
+                    split_files = await split_video(file_path, user_id, message)
+                    
+                    if not split_files:
+                        await app.send_message(user_id, f"Failed to split large file: {filename}")
+                        continue
+                    
+                    # Restore original status message with additional info
+                    await message.edit_text(
+                        f"{original_status}"
+                        f"Uploading {len(split_files)} split parts...",
+                        reply_markup=cancel_button
+                    )
+                    
+                    # Upload each part
+                    for part_index, part_file in enumerate(split_files, 1):
+                        part_filename = os.path.basename(part_file)
+                        
+                        # Update main status with part info
+                        await message.edit_text(
+                            f"{original_status}"
+                            f"Uploading part {part_index}/{len(split_files)}...",
+                            reply_markup=cancel_button
+                        )
+                        
+                        # Get video duration if possible
+                        try:
+                            duration_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', part_file]
+                            duration = int(float(subprocess.check_output(duration_cmd).decode('utf-8').strip()))
+                        except:
+                            duration = 0
+                        
+                        # Create a new message for progress tracking
+                        progress_message = await app.send_message(
+                            user_id,
+                            f"Starting upload: {part_filename} (Part {part_index}/{len(split_files)})"
+                        )
+                        
+                        # Start time for progress
+                        start_time = time.time()
+                        
+                        # Upload with progress
+                        await app.send_video(
+                            user_id,
+                            part_file,
+                            caption=f"{filename} - Part {part_index}/{len(split_files)}\n\nFrom playlist: {playlist_title}",
+                            supports_streaming=True,
+                            duration=duration,
+                            thumb=thumbnail_path if has_thumbnail else None,
+                            progress=progress,
+                            progress_args=(progress_message, start_time, "upload", part_filename, playlist_title, i, len(files))
+                        )
+                        
+                        # Delete progress message after upload
+                        await progress_message.delete()
 
-                    # Add 4-second delay between uploads to avoid flood wait
-                    if part_index < len(split_files):
-                        await asyncio.sleep(Config.UPLOAD_INTERVAL)
-                
-                # Update status after all parts are uploaded
-                await message.edit_text(
-                    f"📤 Uploading: {playlist_title}\n"
-                    f"File {i}/{len(files)}: {filename}\n\n"
-                    f"✅ All {len(split_files)} parts uploaded successfully!",
-                    reply_markup=cancel_button
-                )
+                        # Add 4-second delay between uploads to avoid flood wait
+                        if part_index < len(split_files):
+                            await asyncio.sleep(Config.UPLOAD_INTERVAL)
+                    
+                    # Update status after all parts are uploaded
+                    await message.edit_text(
+                        f"📤 Uploading: {playlist_title}\n"
+                        f"File {i}/{len(files)}: {filename}\n\n"
+                        f"✅ All {len(split_files)} parts uploaded successfully!",
+                        reply_markup=cancel_button
+                    )
             else:
                 # Regular upload for normal sized files
-                # Get video duration if possible
+                # Get audio duration if possible
                 try:
                     duration_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file_path]
                     duration = int(float(subprocess.check_output(duration_cmd).decode('utf-8').strip()))
@@ -576,17 +640,28 @@ async def upload_videos_to_telegram(user_id, files, playlist_title, message):
                 # Start time for progress
                 start_time = time.time()
                 
-                # Upload with progress
-                await app.send_video(
-                    user_id,
-                    file_path,
-                    caption=f"{filename}\n\nFrom playlist: {playlist_title}",
-                    supports_streaming=True,
-                    duration=duration,
-                    thumb=thumbnail_path if has_thumbnail else None,
-                    progress=progress,
-                    progress_args=(progress_message, start_time, "upload", filename, playlist_title, i, len(files))
-                )
+                # Upload with progress - for audio files use send_audio instead of send_video
+                if is_audio:
+                    await app.send_audio(
+                        user_id,
+                        file_path,
+                        caption=f"{filename}\n\nFrom playlist: {playlist_title}",
+                        duration=duration,
+                        thumb=thumbnail_path if has_thumbnail else None,
+                        progress=progress,
+                        progress_args=(progress_message, start_time, "upload", filename, playlist_title, i, len(files))
+                    )
+                else:
+                    await app.send_video(
+                        user_id,
+                        file_path,
+                        caption=f"{filename}\n\nFrom playlist: {playlist_title}",
+                        supports_streaming=True,
+                        duration=duration,
+                        thumb=thumbnail_path if has_thumbnail else None,
+                        progress=progress,
+                        progress_args=(progress_message, start_time, "upload", filename, playlist_title, i, len(files))
+                    )
                 
                 # Delete progress message after upload
                 await progress_message.delete()
@@ -1114,6 +1189,10 @@ async def handle_url(client, message):
     
     keyboard = InlineKeyboardMarkup([
         [
+            InlineKeyboardButton("🎵 MP3", callback_data="format_mp3"),
+            InlineKeyboardButton("🎵 WAV", callback_data="format_wav")
+        ],
+        [
             InlineKeyboardButton("144p", callback_data="quality_144"),
             InlineKeyboardButton("240p", callback_data="quality_240")
         ],
@@ -1152,6 +1231,123 @@ async def handle_url(client, message):
         f"Please select download quality:",
         reply_markup=keyboard
     )
+
+@app.on_callback_query(filters.regex(r'^format_'))
+async def handle_format_selection(client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    data = callback_query.data
+    
+    # Check if it's a format selection
+    if data.startswith("format_"):
+        format_type = data.split('_')[1]
+        
+        if user_id not in user_data:
+            await callback_query.answer("Session expired. Please send the URL again.")
+            return
+        
+        url = user_data[user_id]['url']
+        user_data[user_id]['format_type'] = format_type
+        
+        # Make sure user is in active processes
+        if user_id not in active_processes:
+            active_processes[user_id] = {"status_message_id": callback_query.message.id, "cancelled": False}
+        
+        await callback_query.message.edit_text(
+            f"Starting download process with {format_type.upper()} audio format..."
+        )
+        
+        # Download the playlist as audio
+        result = await download_playlist_audio(url, user_id, format_type, callback_query.message)
+        
+        # If download failed or was cancelled
+        if not result:
+            if not active_processes.get(user_id, {}).get("cancelled", False):
+                await callback_query.message.edit_text("Download failed. Please try again.")
+            active_processes.pop(user_id, None)
+
+# Add this function to download playlist as audio
+async def download_playlist_audio(url, user_id, format_type, message):
+    """Download videos from playlist as audio files with specified format"""
+    download_path = create_download_folder(user_id)
+    
+    playlist_info = get_video_info(url)
+    if not playlist_info:
+        await message.edit_text("Failed to get playlist information.")
+        return False
+
+    playlist_title = playlist_info.get('title', 'Playlist')
+    total_videos = len(playlist_info['entries'])
+    
+    await message.edit_text(
+        f"📥 Downloading: {playlist_title}\n"
+        f"Total tracks: {total_videos}\n"
+        f"Selected format: {format_type.upper()}\n\n"
+        f"0/{total_videos} completed"
+    )
+
+    downloaded_files = []
+    
+    for i, entry in enumerate(playlist_info['entries'], 1):
+        # Check if process was cancelled
+        if active_processes.get(user_id, {}).get("cancelled", False):
+            await message.edit_text("Process cancelled by user.")
+            # Clean up downloaded files
+            cleanup_path = f"downloads/{user_id}"
+            if os.path.exists(cleanup_path):
+                shutil.rmtree(cleanup_path)
+            return False
+            
+        if entry:
+            track_title = entry.get('title', f'Track {i}')
+            video_url = entry['webpage_url']
+            
+            await message.edit_text(
+                f"📥 Downloading: {playlist_title}\n"
+                f"Total tracks: {total_videos}\n"
+                f"Selected format: {format_type.upper()}\n\n"
+                f"Downloading {i}/{total_videos}: {track_title}"
+            )
+            
+            filename = download_audio(video_url, download_path, format_type)
+            if filename:
+                downloaded_files.append(filename)
+            
+            await message.edit_text(
+                f"📥 Downloading: {playlist_title}\n"
+                f"Total tracks: {total_videos}\n"
+                f"Selected format: {format_type.upper()}\n\n"
+                f"{i}/{total_videos} completed"
+            )
+
+    # Show upload options after download is complete
+    if downloaded_files:
+        # Create keyboard with upload options
+        upload_keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📤 Upload to Telegram", callback_data=f"upload_telegram_{user_id}"),
+                InlineKeyboardButton("☁️ Upload to GoFile", callback_data=f"upload_gofile_{user_id}")
+            ],
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_process")]
+        ])
+        
+        await message.edit_text(
+            f"✅ Download completed!\n"
+            f"Playlist: {playlist_title}\n"
+            f"Total audio files: {len(downloaded_files)}\n"
+            f"Format: {format_type.upper()}\n\n"
+            f"Please select where to upload:",
+            reply_markup=upload_keyboard
+        )
+        
+        # Store download info for later use
+        user_data[user_id]['files'] = downloaded_files
+        user_data[user_id]['playlist_title'] = f"{playlist_title} ({format_type.upper()})"
+        user_data[user_id]['is_audio'] = True
+        
+        return True
+    else:
+        await message.edit_text("Download failed. No files were downloaded.")
+        return False
 
 @app.on_callback_query(filters.regex(r'^quality_'))
 async def handle_quality_selection(client, callback_query: CallbackQuery):
