@@ -758,10 +758,11 @@ async def upload_to_gofile(file_path, message, current_video_title, folder_id=No
         start_time = time.time()
         last_update_time = start_time
         update_interval = 5  # Reduced to 5 seconds for more frequent updates
+        last_progress_text = ""  # Track the last progress text to avoid duplicate updates
 
-        # Progress callback function remains unchanged
+        # Progress callback function with improved error handling
         def progress_callback(monitor):
-            nonlocal last_update_time
+            nonlocal last_update_time, last_progress_text
             current_time = time.time()
             
             if current_time - last_update_time >= update_interval:
@@ -789,25 +790,33 @@ async def upload_to_gofile(file_path, message, current_video_title, folder_id=No
                         f"⏰ ETA: {format_time(eta)}"
                     )
 
-                    # Add cancel button
-                    cancel_button = {
-                        "reply_markup": {
-                            "inline_keyboard": [[{
-                                "text": "❌ Cancel",
-                                "callback_data": f"cancel_{message.id}"
-                            }]]
+                    # Only update if the text has changed
+                    if progress_text != last_progress_text:
+                        # Add cancel button
+                        cancel_button = {
+                            "reply_markup": {
+                                "inline_keyboard": [[{
+                                    "text": "❌ Cancel",
+                                    "callback_data": f"cancel_{message.id}"
+                                }]]
+                            }
                         }
-                    }
-                    
-                    requests.post(
-                        f"https://api.telegram.org/bot{Config.BOT_TOKEN}/editMessageText",
-                        json={
-                            "chat_id": message.chat.id,
-                            "message_id": message.id,
-                            "text": progress_text,
-                            "reply_markup": cancel_button["reply_markup"]
-                        }
-                    )
+                        
+                        try:
+                            requests.post(
+                                f"https://api.telegram.org/bot{Config.BOT_TOKEN}/editMessageText",
+                                json={
+                                    "chat_id": message.chat.id,
+                                    "message_id": message.id,
+                                    "text": progress_text,
+                                    "reply_markup": cancel_button["reply_markup"]
+                                }
+                            )
+                            last_progress_text = progress_text  # Update the last text
+                        except Exception as e:
+                            # Just log the error but don't stop the upload
+                            print(f"Failed to update progress: {str(e)}")
+                            
                     # Check if upload was cancelled
                     if upload_cancelled.get(message.id, False):
                         print("Upload cancelled by user")
@@ -834,7 +843,7 @@ async def upload_to_gofile(file_path, message, current_video_title, folder_id=No
             
             # Add folder ID if provided
             if folder_id:
-                fields['folderId'] = (None, folder_id)  # Fix: Properly format multipart form data
+                fields['folderId'] = (None, folder_id)
                 
             encoder = MultipartEncoder(fields=fields)
             monitor = MultipartEncoderMonitor(encoder, callback=progress_callback)
@@ -861,7 +870,7 @@ async def upload_to_gofile(file_path, message, current_video_title, folder_id=No
 
             result = response.json()
             
-            if result["status"] == "ok" and isinstance(result["data"], dict):  # Fix: Check if data is a dictionary
+            if result["status"] == "ok" and isinstance(result["data"], dict):
                 return result["data"]
             else:
                 print(f"Unexpected response format: {result}")
