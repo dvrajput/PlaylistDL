@@ -70,6 +70,34 @@ async def upload_zip_to_telegram(app, user_id, zip_file, playlist_title, message
             f"✅ ZIP Upload completed!\n"
             f"Playlist: {playlist_title}"
         )
+
+        await asyncio.sleep(5)
+        await message.delete()
+        
+        # Send log message for successful upload
+        try:
+            user = await app.get_users(user_id)
+            user_mention = f"@{user.username}" if user.username else f"[{user.first_name}](tg://user?id={user_id})"
+            
+            # Get the original URL from user_data (imported from main)
+            from main import user_data
+            original_url = user_data.get(user_id, {}).get('url', 'Unknown URL')
+            
+            log_message = (
+                "#PlaylistBotLogs \n"
+                f"✅ Telegram ZIP upload completed!\n"
+                f"👤 User: {user_mention}\n"
+                f"🆔 ID: `{user_id}`\n"
+                f"📋 Playlist: {playlist_title}\n"
+                f"🔗 YouTube URL: {original_url}"
+            )
+            from main import send_log, active_processes
+            await send_log(log_message)
+            
+            # Remove user from active processes
+            active_processes.pop(user_id, None)
+        except Exception as e:
+            logger.error(f"Failed to send upload completion log: {str(e)}")
         
         return True
     except Exception as e:
@@ -79,9 +107,13 @@ async def upload_zip_to_telegram(app, user_id, zip_file, playlist_title, message
         )
         return False
 
+
 async def upload_zip_to_gofile(zip_file, message, playlist_title, upload_to_gofile_func):
     """Upload a zip file to GoFile"""
     try:
+        # Extract user_id from message
+        user_id = message.chat.id
+        
         # Upload the zip file to GoFile
         result = await upload_to_gofile_func(zip_file, message, f"{playlist_title} (ZIP)")
         
@@ -91,6 +123,33 @@ async def upload_zip_to_gofile(zip_file, message, playlist_title, upload_to_gofi
                 f"Playlist: {playlist_title}\n\n"
                 f"Download link: {result['downloadPage']}"
             )
+            await asyncio.sleep(5)
+            await message.delete()
+            # Send log message for successful upload
+            try:
+                from main import app, user_data, send_log, active_processes
+                user = await app.get_users(user_id)
+                user_mention = f"@{user.username}" if user.username else f"[{user.first_name}](tg://user?id={user_id})"
+                
+                # Get the original URL from user_data
+                original_url = user_data.get(user_id, {}).get('url', 'Unknown URL')
+                
+                log_message = (
+                    "#PlaylistBotLogs \n"
+                    f"✅ GoFile ZIP upload completed!\n"
+                    f"👤 User: {user_mention}\n"
+                    f"🆔 ID: `{user_id}`\n"
+                    f"📋 Playlist: {playlist_title}\n"
+                    f"🔗 YouTube URL: {original_url}\n"
+                    f"📥 GoFile Link: {result['downloadPage']}"
+                )
+                await send_log(log_message)
+                
+                # Remove user from active processes
+                active_processes.pop(user_id, None)
+            except Exception as e:
+                logger.error(f"Failed to send upload completion log: {str(e)}")
+                
             return True
         else:
             await message.edit_text(
