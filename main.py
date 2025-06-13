@@ -3,15 +3,14 @@ import os
 import shutil
 import time
 import subprocess
-from pyrogram import __version__
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, LinkPreviewOptions
 import logging
 import asyncio
+from zip_utils import create_zip_file, upload_zip_to_telegram, upload_zip_to_gofile
 import requests
 from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
 from config import Config
-print(__version__)
 
 # Disable pyrogram logging
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
@@ -264,8 +263,9 @@ async def progress(current, total, message, start_time, operation, filename=None
             filled = int(percentage / 10)
             bar = '█' * filled + '░' * (10 - filled)
             eta = (total - current) / speed if speed > 0 else 0
+            # Convert speed to Mbps instead of bytes/s
+            speed_mbps = speed / (1024 * 1024) * 8  # Convert bytes/s to Mbps
             
-
             try:
                 if operation == "upload" and playlist_title and filename and file_index is not None and total_files is not None:
                     progress_text = (
@@ -447,11 +447,14 @@ async def download_playlist(url, user_id, quality, message):
 
     # Show upload options after download is complete
     if downloaded_files:
-        # Create keyboard with upload options
+        # Create keyboard with upload options including ZIP option
         upload_keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("📤 Upload to Telegram", callback_data=f"upload_telegram_{user_id}"),
                 InlineKeyboardButton("☁️ Upload to GoFile", callback_data=f"upload_gofile_{user_id}")
+            ],
+            [
+                InlineKeyboardButton("🗜️ Upload as ZIP", callback_data=f"toggle_zip_{user_id}_off")
             ],
             [InlineKeyboardButton("❌ Cancel", callback_data="cancel_process")]
         ])
@@ -460,13 +463,15 @@ async def download_playlist(url, user_id, quality, message):
             f"✅ Download completed!\n"
             f"Playlist: {playlist_title}\n"
             f"Total files: {len(downloaded_files)}\n\n"
-            f"Please select where to upload:",
+            f"Please select where to upload:\n"
+            f"ZIP Mode: Off",
             reply_markup=upload_keyboard
         )
         
         # Store download info for later use
         user_data[user_id]['files'] = downloaded_files
         user_data[user_id]['playlist_title'] = playlist_title
+        user_data[user_id]['zip_mode'] = False
         
         return True
     else:
@@ -1274,7 +1279,6 @@ async def handle_format_selection(client, callback_query: CallbackQuery):
                 await callback_query.message.edit_text("Download failed. Please try again.")
             active_processes.pop(user_id, None)
 
-# Add this function to download playlist as audio
 async def download_playlist_audio(url, user_id, format_type, message):
     """Download videos from playlist as audio files with specified format"""
     download_path = create_download_folder(user_id)
@@ -1330,11 +1334,14 @@ async def download_playlist_audio(url, user_id, format_type, message):
 
     # Show upload options after download is complete
     if downloaded_files:
-        # Create keyboard with upload options
+        # Create keyboard with upload options including ZIP option
         upload_keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("📤 Upload to Telegram", callback_data=f"upload_telegram_{user_id}"),
                 InlineKeyboardButton("☁️ Upload to GoFile", callback_data=f"upload_gofile_{user_id}")
+            ],
+            [
+                InlineKeyboardButton("🗜️ Upload as ZIP", callback_data=f"toggle_zip_{user_id}_off")
             ],
             [InlineKeyboardButton("❌ Cancel", callback_data="cancel_process")]
         ])
@@ -1344,7 +1351,8 @@ async def download_playlist_audio(url, user_id, format_type, message):
             f"Playlist: {playlist_title}\n"
             f"Total audio files: {len(downloaded_files)}\n"
             f"Format: {format_type.upper()}\n\n"
-            f"Please select where to upload:",
+            f"Please select where to upload:\n"
+            f"ZIP Mode: Off",
             reply_markup=upload_keyboard
         )
         
@@ -1352,6 +1360,7 @@ async def download_playlist_audio(url, user_id, format_type, message):
         user_data[user_id]['files'] = downloaded_files
         user_data[user_id]['playlist_title'] = f"{playlist_title} ({format_type.upper()})"
         user_data[user_id]['is_audio'] = True
+        user_data[user_id]['zip_mode'] = False
         
         return True
     else:
@@ -1391,6 +1400,59 @@ async def handle_quality_selection(client, callback_query: CallbackQuery):
                 await callback_query.message.edit_text("Download failed. Please try again.")
             active_processes.pop(user_id, None)
 
+@app.on_callback_query(filters.regex(r'^toggle_zip_\d+_(on|off)$'))
+async def toggle_zip_mode(client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    data = callback_query.data
+    
+    # Extract user ID and current state from callback data
+    parts = data.split('_')
+    target_user_id = int(parts[2])
+    current_state = parts[3]  # "on" or "off"
+    
+    # Verify this is the correct user
+    if user_id != target_user_id:
+        await callback_query.answer("This is not your download.")
+        return
+    
+    if user_id not in user_data or 'files' not in user_data[user_id]:
+        await callback_query.answer("Session expired. Please start over.")
+        return
+    
+    # Toggle the state
+    new_state = "off" if current_state == "on" else "on"
+    user_data[user_id]['zip_mode'] = (new_state == "on")
+    
+    # Get the current message text and update it
+    message_text = callback_query.message.text
+    if "ZIP Mode:" in message_text:
+        message_text = message_text.replace(f"ZIP Mode: {current_state.capitalize()}", f"ZIP Mode: {new_state.capitalize()}")
+    
+    # Update the keyboard with the new toggle state
+    files = user_data[user_id]['files']
+    playlist_title = user_data[user_id]['playlist_title']
+    
+    upload_keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📤 Upload to Telegram", callback_data=f"upload_telegram_{user_id}"),
+            InlineKeyboardButton("☁️ Upload to GoFile", callback_data=f"upload_gofile_{user_id}")
+        ],
+        [
+            InlineKeyboardButton(
+                f"🗜️ Upload as ZIP: {'✅ On' if new_state == 'on' else '❌ Off'}", 
+                callback_data=f"toggle_zip_{user_id}_{new_state}"
+            )
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_process")]
+    ])
+    
+    await callback_query.message.edit_text(
+        message_text,
+        reply_markup=upload_keyboard
+    )
+    
+    await callback_query.answer(f"ZIP mode: {new_state.upper()}")
+
 @app.on_callback_query(filters.regex(r'^upload_(telegram|gofile)_\d+$'))
 async def handle_upload_selection(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
@@ -1410,6 +1472,7 @@ async def handle_upload_selection(client, callback_query: CallbackQuery):
     
     files = user_data[user_id]['files']
     playlist_title = user_data[user_id]['playlist_title']
+    zip_mode = user_data[user_id].get('zip_mode', False)
     
     # Make sure user is in active processes
     if user_id not in active_processes:
@@ -1417,12 +1480,45 @@ async def handle_upload_selection(client, callback_query: CallbackQuery):
     
     await callback_query.answer(f"Starting upload to {upload_type.capitalize()}...")
     
-    if upload_type == 'telegram':
-        # Use existing function for Telegram uploads
-        await upload_videos_to_telegram(user_id, files, playlist_title, callback_query.message)
-    else:  # GoFile
-        # Use new function for GoFile uploads
-        await upload_files_to_gofile(user_id, files, playlist_title, callback_query.message)
+    # Handle ZIP mode if enabled
+    if zip_mode:
+        await callback_query.message.edit_text(
+            f"Creating ZIP archive for {playlist_title}...\n"
+            f"This may take some time depending on the size of the files."
+        )
+        
+        # Create the ZIP file
+        zip_file = await create_zip_file(files, user_id, playlist_title)
+        
+        if not zip_file:
+            await callback_query.message.edit_text(
+                f"❌ Failed to create ZIP archive.\n"
+                f"Please try again or upload files individually."
+            )
+            return
+        
+        # Upload the ZIP file based on selected destination
+        if upload_type == 'telegram':
+            await upload_zip_to_telegram(app, user_id, zip_file, playlist_title, 
+                                         callback_query.message, progress)
+        else:  # GoFile
+            await upload_zip_to_gofile(zip_file, callback_query.message, 
+                                       playlist_title, upload_to_gofile)
+        
+        # Clean up the ZIP file after upload
+        try:
+            if os.path.exists(zip_file):
+                os.remove(zip_file)
+        except Exception as e:
+            logger.error(f"Error removing ZIP file: {str(e)}")
+    else:
+        # Regular upload without ZIP
+        if upload_type == 'telegram':
+            # Use existing function for Telegram uploads
+            await upload_videos_to_telegram(user_id, files, playlist_title, callback_query.message)
+        else:  # GoFile
+            # Use existing function for GoFile uploads
+            await upload_files_to_gofile(user_id, files, playlist_title, callback_query.message)
 
 # Then modify your existing cancel_upload function to only handle numeric IDs
 @app.on_callback_query(filters.regex(r'^cancel_\d+$'))
