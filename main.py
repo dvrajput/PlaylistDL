@@ -265,7 +265,7 @@ async def progress(current, total, message, start_time, operation, filename=None
             eta = (total - current) / speed if speed > 0 else 0
             # Convert speed to Mbps instead of bytes/s
             speed_mbps = speed / (1024 * 1024) * 8  # Convert bytes/s to Mbps
-            
+
             try:
                 if operation == "upload" and playlist_title and filename and file_index is not None and total_files is not None:
                     progress_text = (
@@ -344,6 +344,9 @@ def download_video(video_url, download_path, quality):
         '2160': 'bestvideo[height<=2160]+bestaudio/best[height<=2160]'
     }
     
+    # Debug log to verify the quality parameter
+    logger.info(f"Downloading video with quality: {quality}")
+    
     ydl_opts = {
         'format': format_string.get(quality, 'bestvideo+bestaudio/best'),
         'outtmpl': os.path.join(download_path, '%(title)s.%(ext)s'),
@@ -395,6 +398,9 @@ def download_audio(video_url, download_path, format_type):
 async def download_playlist(url, user_id, quality, message):
     """Download videos from playlist with specified quality"""
     download_path = create_download_folder(user_id)
+    
+    # Debug log to verify the quality parameter
+    logger.info(f"Starting playlist download with quality: {quality}")
     
     playlist_info = get_video_info(url)
     if not playlist_info:

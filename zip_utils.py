@@ -1,3 +1,4 @@
+  GNU nano 7.2                                                                zip_utils.py *                                                                       
 import os
 import zipfile
 import shutil
@@ -65,10 +66,9 @@ async def upload_zip_to_telegram(app, user_id, zip_file, playlist_title, message
         
         # Delete progress message after upload
         await progress_message.delete()
-        
         await message.edit_text(
-            f"✅ ZIP Upload completed!\n"
-            f"Playlist: {playlist_title}"
+        f"✅ ZIP Upload completed!\n"
+        f"Playlist: {playlist_title}"
         )
 
         await asyncio.sleep(5)
@@ -76,11 +76,12 @@ async def upload_zip_to_telegram(app, user_id, zip_file, playlist_title, message
         
         # Send log message for successful upload
         try:
+            # Use the app instance passed to the function instead of importing it
             user = await app.get_users(user_id)
             user_mention = f"@{user.username}" if user.username else f"[{user.first_name}](tg://user?id={user_id})"
             
-            # Get the original URL from user_data (imported from main)
-            from main import user_data
+            # Import only what's needed
+            from main import user_data, send_log, active_processes
             original_url = user_data.get(user_id, {}).get('url', 'Unknown URL')
             
             log_message = (
@@ -91,7 +92,6 @@ async def upload_zip_to_telegram(app, user_id, zip_file, playlist_title, message
                 f"📋 Playlist: {playlist_title}\n"
                 f"🔗 YouTube URL: {original_url}"
             )
-            from main import send_log, active_processes
             await send_log(log_message)
             
             # Remove user from active processes
@@ -106,7 +106,6 @@ async def upload_zip_to_telegram(app, user_id, zip_file, playlist_title, message
             f"❌ Failed to upload ZIP file: {str(e)}"
         )
         return False
-
 
 async def upload_zip_to_gofile(zip_file, message, playlist_title, upload_to_gofile_func):
     """Upload a zip file to GoFile"""
@@ -123,24 +122,20 @@ async def upload_zip_to_gofile(zip_file, message, playlist_title, upload_to_gofi
                 f"Playlist: {playlist_title}\n\n"
                 f"Download link: {result['downloadPage']}"
             )
-            await asyncio.sleep(5)
-            await message.delete()
             # Send log message for successful upload
             try:
-                from main import app, user_data, send_log, active_processes
-                user = await app.get_users(user_id)
-                user_mention = f"@{user.username}" if user.username else f"[{user.first_name}](tg://user?id={user_id})"
+                # Import only what's needed, not the app
+                from main import send_log, active_processes, user_data
                 
-                # Get the original URL from user_data
-                original_url = user_data.get(user_id, {}).get('url', 'Unknown URL')
-                
+                # Pass the app instance to the function instead
+                # Modify the function signature in main.py to accept app parameter
                 log_message = (
                     "#PlaylistBotLogs \n"
                     f"✅ GoFile ZIP upload completed!\n"
-                    f"👤 User: {user_mention}\n"
+                    f"👤 User: ID {user_id}\n"
                     f"🆔 ID: `{user_id}`\n"
                     f"📋 Playlist: {playlist_title}\n"
-                    f"🔗 YouTube URL: {original_url}\n"
+                    f"🔗 YouTube URL: {user_data.get(user_id, {}).get('url', 'Unknown URL')}\n"
                     f"📥 GoFile Link: {result['downloadPage']}"
                 )
                 await send_log(log_message)
